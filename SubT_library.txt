@@ -1,0 +1,1301 @@
+// ==============================================================
+// SUB TERRA: AI DUNGEON ENGINE | LIBRARY | PROTOTYPE v0.4
+// ==============================================================
+// Hidden simulation: JavaScript decides mechanics; narrator reports
+// consequences. All persistent data lives in state.subterra.
+// Library code is shared by the Input, Context and Output modifiers.
+//
+// PROVISIONAL / NOT YET CANONICAL:
+// - Shapes and exit counts of individual tiles are generated from
+//   sample patterns; exact printed tile geometry is not encoded.
+// - The 30-card hazard pool uses an equal split of five hazard types.
+// - Hazard deck exhaustion is logged but has no endgame rule yet.
+// - NPC turns use two AP to follow explored safe passages; Medic may heal.
+//   Other role-specific NPC skills remain unimplemented.
+// - Character-specific skills and fighting await specifications.
+// ============================================================== 
+
+const ST_DIRS = ['N', 'E', 'S', 'W'];
+const ST_OPP = { N: 'S', E: 'W', S: 'N', W: 'E' };
+const ST_TILE_COUNTS = {
+    Normal: 16, Water: 8, Gas: 8, 'Cave-In': 12,
+    Horror: 8, Squeeze: 3, Ledge: 3, Slide: 3,
+    'Rough Terrain': 3
+};
+const ST_ROLES = [
+    'Leader', 'Climbing Expert', 'Bodyguard', 'Geologist',
+    'Diver', 'Explosives Expert', 'Medic'
+];
+
+// Bounded diagnostic output. Events become storyteller instructions.
+function stLog(category, message) {
+    console.log('ST | ' + category + ' | ' + message);
+}
+// Event Ledger: lightweight, persistent, authoritative mechanical facts.
+// Existing game functions call stEvent(); no direct AI-generated fiction
+// is ever written into these records. Only player-observable events are
+// eligible for an Output fallback if the model misses their narration.
+function stEvent(message) {
+    const s = state.subterra;
+    if (!s) return;
+    s.events.push(message);
+    if (s.events.length > 20) s.events.shift();
+    if (!s.sync) stInitSync(s);
+    const kind = /^Player moves /i.test(message) ? 'MOVE' :
+        /^On the NPC turn:|^The Medic treats /i.test(message) ? 'NPC' :
+        /^Hazard phase:/i.test(message) ? 'HAZARD' :
+        / loses \d+ HP /i.test(message) ? 'INJURY' :
+        /^A Horror |^The cave-in passage /i.test(message) ? 'THREAT' : 'INFO';
+    const critical = ['MOVE','NPC','HAZARD','INJURY','THREAT'].includes(kind);
+    // A hazard card draw is hidden unless its consequences are observable.
+    // A remote Horror movement/spawn is likewise not automatically known.
+    let visible = kind !== 'THREAT' && kind !== 'HAZARD';
+    if (kind === 'INJURY') {
+        const injured=stAllActors().find(a=>String(message).startsWith((a.name || a.role)+' loses '));
+        visible=!!(injured && injured.location===s.player.location);
+    }
+    if (kind === 'HAZARD') {
+        const type = String(message).replace(/^Hazard phase:\s*/i,'').replace(/\.$/,'');
+        visible = type === 'Tremor' || (type === 'Flood' && !!getTile(s.player.location)?.flooded) ||
+            (type === 'Gas' && !!getTile(s.player.location)?.activeGas);
+    }
+    if (kind === 'THREAT') {
+        visible = /Horror/.test(message) && s.horrors.some(loc =>
+            loc === s.player.location || stNeighbors(s.player.location).includes(loc));
+        if (/cave-in passage /i.test(message)) {
+            const match = /at ([A-Z]+[0-9]+)/.exec(message);
+            visible = !!(match && (match[1] === s.player.location || stNeighbors(s.player.location).includes(match[1])));
+        }
+    }
+    let fallback = '';
+    if (kind === 'NPC') fallback = /^The Medic treats /i.test(message)
+        ? 'The Medic tends to an injured teammate.'
+        : 'You notice members of the expedition repositioning along explored passages.';
+    if (kind === 'HAZARD') fallback = /Tremor/.test(message)
+        ? 'A tremor shudders through the cave, sending grit from the ceiling.'
+        : /Flood/.test(message) ? 'Water surges into the passage.'
+        : /Gas/.test(message) ? 'Dangerous gas spreads through the passage.' : '';
+    if (kind === 'INJURY') fallback = message.replace(/\b[A-Z]{1,3}\d+\b/g, 'the passage');
+    if (kind === 'THREAT' && visible) fallback = /Horror/.test(message)
+        ? 'A Horror stirs dangerously close to the expedition.'
+        : 'Rock crashes down across a nearby passage.';
+    if (kind === 'MOVE') {
+        const m=/Player moves ([NESW]) from [A-Z]+[0-9]+ into ([\w-]+(?: [\w-]+)?) tile/i.exec(message);
+        const names={N:'north',E:'east',S:'south',W:'west'};
+        fallback='The expedition advances '+(m?names[m[1]]:'along a passage')+' into '+(m?m[2].toLowerCase():'the explored cave')+' terrain.';
+    }
+    const entry = { id: ++s.sync.eventSerial, kind, text: message,
+        round: s.round, visible, critical: critical && visible && !!fallback,
+        fallback, createdBy: s.sync.phase || 'GAME' };
+    s.sync.pending.push(entry);
+    if (s.sync.pending.length > 30) s.sync.pending.splice(0, s.sync.pending.length - 30);
+    stLog('EVENT', 'id=' + entry.id + ' kind=' + kind + ' visible=' + visible + ' ' + message);
+}
+
+// Upgrade old saved adventures without destroying the map/decks.
+function stInitSync(s) {
+    if (!s.sync) s.sync = { version:1, eventSerial:0, pending:[], offered:[], phase:'GAME' };
+    if (!Array.isArray(s.sync.pending)) s.sync.pending=[];
+    if (!Array.isArray(s.sync.offered)) s.sync.offered=[];
+    if (!Number.isFinite(s.sync.eventSerial)) s.sync.eventSerial=0;
+    return s.sync;
+}
+
+// Current map facts are sent EVERY generation; events only until
+// delivery. NPC positions outside sight are not revealed to players.
+function stSyncSnapshot() {
+    const s=state.subterra,p=s.player,t=getTile(p.location);
+    const present=s.npcs.filter(n=>n.hp>0 && n.location===p.location).map(n=>n.role);
+    const dirs=stDirectionReport(p.location).map(x=>x.dir+':'+x.status+
+        (x.status==='KNOWN'?' ['+x.text+']':'')).join('; ');
+    return 'Location '+p.location+'; tile '+(t?t.type:'?')+'; HP '+p.hp+'/'+p.maxHP+
+        '; AP '+p.ap+'/'+p.maxAP+'; round '+s.round+'; activeGas '+Boolean(t&&t.activeGas)+
+        '; flooded '+Boolean(t&&t.flooded)+'; collapsed '+Boolean(t&&t.collapsed)+
+        '; nearby NPCs '+(present.join(', ')||'none')+'; exits '+dirs+'.';
+}
+
+// Inclusive d6 and reproducible logging of consequential checks.
+function rollD6(label) {
+    const result = Math.floor(Math.random() * 6) + 1;
+    stLog('D6', (label || 'roll') + '=' + result);
+    return result;
+}
+function stSkillCheck(label, bonus) {
+    const n = rollD6(label);
+    const threshold = 4 - (bonus || 0);
+    const success = n >= threshold;
+    stLog('CHECK', label + ' ' + n + '>=' + threshold + ' ' + (success ? 'PASS' : 'FAIL'));
+    return success;
+}
+
+// Fisher-Yates shuffle (top-of-deck is the END of each array).
+function stShuffle(cards) {
+    for (let i = cards.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        const x = cards[i]; cards[i] = cards[j]; cards[j] = x;
+    }
+    return cards;
+}
+
+// Coordinate helpers: AZ70, BA70, etc. Stable A-Z/AA/AB columns.
+function stColNumber(letters) {
+    let value = 0;
+    for (const ch of letters) value = value * 26 + ch.charCodeAt(0) - 64;
+    return value - 1;
+}
+function stColLetters(index) {
+    let out = '';
+    for (let n = index + 1; n > 0; n = Math.floor((n - 1) / 26)) {
+        out = String.fromCharCode(65 + (n - 1) % 26) + out;
+    }
+    return out;
+}
+function stParseCoord(coord) {
+    const m = /^([A-Z]+)([1-9]\d*)$/.exec(String(coord || '').toUpperCase());
+    if (!m) return null;
+    const col = stColNumber(m[1]);
+    const row = Number(m[2]) - 1;
+    if (col < 0 || row < 0 || col > 180 || row > 180) return null;
+    return { col, row };
+}
+function stStep(coord, direction) {
+    const p = stParseCoord(coord);
+    if (!p || !ST_OPP[direction]) return null;
+    const col = p.col + (direction === 'E' ? 1 : direction === 'W' ? -1 : 0);
+    const row = p.row + (direction === 'S' ? 1 : direction === 'N' ? -1 : 0);
+    return col < 0 || row < 0 || col > 180 || row > 180
+        ? null : stColLetters(col) + String(row + 1);
+}
+
+// Actual 2D array indexed [numbered row - 1][alpha column index].
+// Rows are created lazily to avoid allocating a huge rectangular map.
+function getTile(coord) {
+    const p = stParseCoord(coord);
+    if (!p) return null;
+    const map = state.subterra.map;
+    return (map[p.row] && map[p.row][p.col]) || null;
+}
+function stSetTile(coord, tile) {
+    const p = stParseCoord(coord);
+    if (!p) return false;
+    const map = state.subterra.map;
+    if (!map[p.row]) map[p.row] = [];
+    if (map[p.row][p.col]) return false;
+    map[p.row][p.col] = tile;
+    return true;
+}
+
+// A tile's type is permanent; mutable flags represent current state.
+function createTile(type, exits, options) {
+    const extra = options || {};
+    return {
+        type: type,
+        Exits: (exits || []).slice(),
+        rope: false,
+        horror: false,     // Currently occupied by a Horror creature
+        collapsed: false,
+        flooded: false,
+        activeGas: false,
+        collapseRolls: extra.collapseRolls || [],
+        arrowDirection: extra.arrowDirection || null
+    };
+}
+
+// Shape generation is PLACEHOLDER: replace with exact tile art data later.
+function stSampleExits(type) {
+    if (type === 'Ledge' || type === 'Slide') return ['N', 'S'];
+    const patterns = [
+        ['N', 'S'], ['N', 'E'], ['N', 'E', 'S'],
+        ['N', 'E', 'S'], ['N', 'E', 'S', 'W'], ['N', 'E'],
+        ['N', 'S'], ['N']
+    ];
+    return patterns[Math.floor(Math.random() * patterns.length)].slice();
+}
+
+// Builds the 64-tile type distribution plus an exit in the LAST 6 draws.
+function buildTileDeck() {
+    const tiles = [];
+    for (const type of Object.keys(ST_TILE_COUNTS)) {
+        for (let i = 0; i < ST_TILE_COUNTS[type]; i++) {
+            const tile = createTile(type, stSampleExits(type), {
+                collapseRolls: type === 'Cave-In'
+                    ? stShuffle([1, 2, 3, 4, 5, 6]).slice(0, 2)
+                    : [],
+                arrowDirection: type === 'Ledge' || type === 'Slide' ? 'N' : null
+            });
+            tiles.push(tile);
+        }
+    }
+    stShuffle(tiles);
+    // Pop draws from the END. Randomly insert exit among final six draws.
+    const exit = createTile('Exit', ['N', 'E', 'S', 'W']);
+    tiles.splice(Math.floor(Math.random() * 6), 0, exit);
+    stLog('DECK', 'tiles=' + tiles.length + ' exitInLastSix=true');
+    return tiles;
+}
+
+// Equal five-type hazard proportions are PROVISIONAL, not card-art data.
+function buildHazardDeck() {
+    const cards = [];
+    for (const type of ['Tremor', 'Flood', 'Gas', 'Cave-In', 'Horror']) {
+        for (let i = 0; i < 6; i++) cards.push({ type });
+    }
+    stShuffle(cards);
+    stLog('DECK', 'hazards=' + cards.length + ' [PROVISIONAL COMPOSITION]');
+    return cards;
+}
+
+function stPlaceholder(key, fallback) {
+    const placeholders = state.placeholders || [];
+    const found = placeholders.find(p => String(p.question || '').toLowerCase() === key.toLowerCase());
+    return found && found.answer ? String(found.answer).trim() : fallback;
+}
+function stCanonicalRole(role) {
+    const alias = { 'climber': 'Climbing Expert', 'engineer': 'Explosives Expert',
+        'explosives expert': 'Explosives Expert', 'climbing expert': 'Climbing Expert' };
+    const lower = String(role || '').toLowerCase().trim();
+    return alias[lower] || ST_ROLES.find(r => r.toLowerCase() === lower) || 'Geologist';
+}
+
+// Initialize the scenario only once. No resets from Context/Output.
+// Upgrade existing test adventures in place; never reset their map/decks.
+// v0.3.2 adds automatic round completion after the final AP is spent.
+// Exert MUST occur before spending the final AP; #endturn is still available.
+function stInit() {
+    if (state.subterra && [1, 3, 4].includes(state.subterra.version)) {
+        const old = state.subterra;
+        if (old.version !== 4) {
+            if (old.version === 1) old.lightsOut = false; // Retired response-count battery rule.
+            stLog('MIGRATE', 'v' + old.version + ' -> v4; existing map and decks preserved');
+            old.version = 4;
+        }
+        if (!Number.isFinite(old.intentSerial)) old.intentSerial = 0;
+        if (typeof old.pendingIntent === 'undefined') old.pendingIntent = null;
+        if (typeof old.hazardDepleted !== 'boolean') old.hazardDepleted = false;
+        if (!Number.isFinite(old.lastResolvedRound)) old.lastResolvedRound = 0;
+        if (typeof old.roundResolving !== 'boolean') old.roundResolving = false;
+        stInitSync(old);
+        return old;
+    }
+    const role = stCanonicalRole(stPlaceholder('Role', 'Geologist'));
+    const start = 'AZ70';
+    state.subterra = {
+        version: 4,
+        lastResolvedRound: 0, // Duplicate-resolution guard.
+        roundResolving: false, // Re-entrancy guard for NPC and hazard phases.
+        map: [],
+        hazardLocations: { horror: [], collapsed: [], flooded: [], gas: [] },
+        tileDeck: [],
+        hazardDeck: [],
+        hazardDiscard: [],
+        playerResponses: 0, // diagnostic tally only; NEVER controls endings
+        intentSerial: 0,
+        pendingIntent: null,
+        hazardDepleted: false, // finite hazard deck, ending rule undecided
+        round: 1,
+        lightsOut: false,
+        gasActive: false,
+        exited: false,
+        exitFound: false,
+        events: [],
+        sync: { version:1, eventSerial:0, pending:[], offered:[], phase:'GAME' },
+        latestSubmission: null,
+        horrors: [],
+        pathHistory: [start],
+        npcs: ST_ROLES.filter(r => r !== role).map(r => ({
+            name: r, role: r, hp: r === 'Bodyguard' ? 5 : 3,
+            maxHP: r === 'Bodyguard' ? 5 : 3, location: start, hiding: false
+        })),
+        player: {
+            name: stPlaceholder('Name', 'The explorer'),
+            gender: stPlaceholder('Male/Female', 'Unspecified'),
+            appearance: stPlaceholder('Appearance', ''),
+            gear: stPlaceholder('Gear', ''),
+            role: role, skill: role,
+            hp: role === 'Bodyguard' ? 5 : 3,
+            maxHP: role === 'Bodyguard' ? 5 : 3,
+            hiding: false, location: start,
+            ap: 2, maxAP: 2, exertUsed: false
+        }
+    };
+    stSetTile(start, createTile('Start', ST_DIRS));
+    state.subterra.tileDeck = buildTileDeck();
+    state.subterra.hazardDeck = buildHazardDeck();
+    stLog('INIT', 'role=' + role + ' start=' + start + ' npcs=' + state.subterra.npcs.length);
+    return state.subterra;
+}
+
+function stRotate(direction, times) {
+    return ST_DIRS[(ST_DIRS.indexOf(direction) + times) % 4];
+}
+function stRotateExits(exits, times) {
+    return exits.map(dir => stRotate(dir, times));
+}
+function stValidConnection(from, to, direction) {
+    return !!from && !!to && from.Exits.includes(direction) &&
+        to.Exits.includes(ST_OPP[direction]);
+}
+
+// Number of tiles traversed since last tile offering >=3 exits.
+// Used as a gentle connection preference, NOT an enforced rule.
+function getCorridorDepth() {
+    const history = state.subterra.pathHistory;
+    let depth = 0;
+    for (let i = history.length - 1; i >= 0 && depth < 20; i--) {
+        const tile = getTile(history[i]);
+        if (tile && tile.Exits.length >= 3) break;
+        depth++;
+    }
+    return depth;
+}
+
+// Evaluate one legally placeable rotation. Reward frontiers normally;
+// reward nearby connections more heavily after long corridors.
+function scoreTilePlacement(template, destination, rotation, corridorDepth) {
+    const exits = stRotateExits(template.Exits, rotation);
+    const arrow = template.arrowDirection ? stRotate(template.arrowDirection, rotation) : null;
+    let score = 0;
+    for (const d of ST_DIRS) {
+        const neighbor = getTile(stStep(destination, d));
+        const hasExit = exits.includes(d);
+        if (!neighbor && hasExit) score += 3;
+        else if (neighbor && hasExit && neighbor.Exits.includes(ST_OPP[d])) {
+            score += corridorDepth >= 3 ? 6 : 2;
+        } else if (neighbor && hasExit && !neighbor.Exits.includes(ST_OPP[d])) {
+            score -= 2;
+        } else if (neighbor && !hasExit && neighbor.Exits.includes(ST_OPP[d])) {
+            score -= 1;
+        }
+    }
+    return { exits, arrow, score };
+}
+
+// Place a drawn tile using legal rotations. The incoming exit must
+// ALWAYS connect. Other connections are preferred, not mandatory.
+function placeTile(template, destination, incomingFromDirection) {
+    if (!template || getTile(destination) || !ST_OPP[incomingFromDirection]) return null;
+    const required = ST_OPP[incomingFromDirection];
+    const corridorDepth = getCorridorDepth();
+    const candidates = [];
+    for (let rotation = 0; rotation < 4; rotation++) {
+        const trial = scoreTilePlacement(template, destination, rotation, corridorDepth);
+        if (!trial.exits.includes(required)) continue;
+        // Ledge and Slide arrows point AWAY from the exploring caver.
+        if (trial.arrow && trial.arrow !== incomingFromDirection) continue;
+        candidates.push({ rotation, ...trial });
+    }
+    if (!candidates.length) {
+        stLog('PLACE', 'FAIL ' + destination + ' type=' + template.type);
+        return null;
+    }
+    // Weighted stochastic choice: good scores favored, not guaranteed.
+    const best = Math.max(...candidates.map(c => c.score));
+    const weights = candidates.map(c => Math.exp((c.score - best) / 3));
+    const sum = weights.reduce((a, b) => a + b, 0);
+    let ticket = Math.random() * sum;
+    let chosen = candidates[candidates.length - 1];
+    for (let i = 0; i < candidates.length; i++) {
+        ticket -= weights[i];
+        if (ticket <= 0) { chosen = candidates[i]; break; }
+    }
+    stLog('PLACE-SCORES', destination + ' corridor=' + corridorDepth + ' ' +
+        candidates.map(c => c.rotation * 90 + ':' + c.score).join(','));
+    const tile = createTile(template.type, chosen.exits, {
+        collapseRolls: template.collapseRolls,
+        arrowDirection: chosen.arrow
+    });
+    if (!stSetTile(destination, tile)) return null;
+    const index = state.subterra.hazardLocations;
+    if (tile.type === 'Horror') index.horror.push(destination);
+    if (tile.type === 'Cave-In') index.collapsed.push(destination);
+    if (tile.type === 'Water') index.flooded.push(destination);
+    if (tile.type === 'Gas') index.gas.push(destination);
+    if (tile.type === 'Gas' && state.subterra.gasActive) tile.activeGas = true;
+    stLog('TILE', 'PLACED ' + destination + ' type=' + tile.type +
+        ' exits=' + tile.Exits.join('') + ' rotation=' + chosen.rotation * 90 +
+        ' deck=' + state.subterra.tileDeck.length);
+    return tile;
+}
+
+// Draw/attempt placement; discarded unplaceable tiles are recorded.
+// No player movement or AP spending occurs in this helper.
+function drawTile(destination, incomingFromDirection) {
+    const s = state.subterra;
+    if (getTile(destination)) return null;
+    while (s.tileDeck.length) {
+        const template = s.tileDeck.pop();
+        const placed = placeTile(template, destination, incomingFromDirection);
+        if (placed) return placed;
+        stLog('TILE', 'DISCARD incompatible template=' + template.type);
+    }
+    stLog('TILE', 'DECK EMPTY at ' + destination);
+    return null;
+}
+
+// ==============================================================
+// MAP-AUTHORITATIVE FREE OBSERVATION
+// ==============================================================
+// The player can look around without AP expenditure. Directions
+// describe ONLY the current tile and already placed neighbors.
+// An unexplored exit is an opening into UNKNOWN darkness; looking
+// does not generate a future tile or establish its terrain type.
+function stDirectionReport(coord) {
+    const source = getTile(coord);
+    if (!source) return ST_DIRS.map(dir => ({ dir, status: 'UNKNOWN', text: 'map position unavailable' }));
+    return ST_DIRS.map(dir => {
+        if (!source.Exits.includes(dir)) {
+            return { dir, status: 'WALL', text: 'solid cave wall; no passage' };
+        }
+        const nextCoord = stStep(coord, dir);
+        if (!nextCoord) return { dir, status: 'WALL', text: 'cave boundary; no passage' };
+        const next = getTile(nextCoord);
+        if (!next) {
+            return { dir, status: 'UNEXPLORED', text: 'visible opening into unexplored darkness; unknown terrain beyond' };
+        }
+        if (!stValidConnection(source, next, dir)) {
+            return { dir, status: 'BLOCKED', text: 'no connecting passage; blocked by rock' };
+        }
+        let text = 'known ' + next.type + ' passage';
+        if (next.collapsed) text += '; impassable rubble';
+        if (next.flooded) text += '; flooded';
+        if (next.activeGas) text += '; active gas';
+        if (next.horror) text += '; Horror present';
+        if (source.type === 'Ledge' && !source.rope && source.arrowDirection === dir) {
+            text += '; descent blocked by unroped ledge';
+        }
+        if (source.type === 'Slide' && !source.rope && ST_OPP[source.arrowDirection] === dir) {
+            text += '; return blocked by unroped slide';
+        }
+        return { dir, status: next.collapsed ? 'BLOCKED' : 'KNOWN', text };
+    });
+}
+function stDirectionReportText(coord) {
+    return stDirectionReport(coord).map(x => x.dir + '=' + x.status + ' (' + x.text + ')').join('; ');
+}
+// --------------------------------------------------------------
+// PLAYER-VISIBLE COMPASS SURVEY
+// --------------------------------------------------------------
+// Every look-around request must list North, East, South and West
+// explicitly. Unlike a prompt, this string is inserted into the
+// final narration by Output. Only map data is used: no AI inference,
+// no drawTile(), no movement, no Action Points.
+function stLookCompassText(coord) {
+    const labels = { N: 'North', E: 'East', S: 'South', W: 'West' };
+    const rows = stDirectionReport(coord);
+    const lines = rows.map(function(row) {
+        let description;
+        if (row.status === 'WALL') {
+            description = 'Solid rock; no traversable passage.';
+        } else if (row.status === 'UNEXPLORED') {
+            description = 'An opening into unexplored darkness; what lies beyond is unknown.';
+        } else if (row.status === 'BLOCKED') {
+            description = 'A passage is blocked or does not connect.';
+            const neighbor = getTile(stStep(coord, row.dir));
+            if (neighbor && neighbor.collapsed) {
+                description = 'A previously explored passage, now blocked by a cave-in.';
+            }
+        } else if (row.status === 'KNOWN') {
+            const tile = getTile(stStep(coord, row.dir));
+            const kind = !tile || tile.type === 'Normal' ? 'cave passage'
+                : tile.type === 'Start' ? 'starting chamber'
+                : tile.type === 'Exit' ? 'exit passage'
+                : tile.type.toLowerCase() + ' passage';
+            const details = [];
+            if (tile && tile.flooded) details.push('flooded');
+            if (tile && tile.activeGas) details.push('gas present');
+            if (tile && tile.horror) details.push('a Horror is present');
+            if (row.text.includes('descent blocked')) details.push('ledge needs a rope');
+            if (row.text.includes('return blocked')) details.push('slide cannot be climbed without a rope');
+            description = 'A previously explored ' + kind +
+                (details.length ? '; ' + details.join('; ') : '') + '.';
+        } else {
+            description = 'Direction cannot be assessed.';
+        }
+        return labels[row.dir] + ': ' + description;
+    });
+    return 'The routes visible from here are:\n' + lines.join('\n');
+}
+// #look / naturally expressed "I look around" is free, no reveal,
+// no location change, no tile draw, no AP cost.
+function lookAround() {
+    const s = state.subterra, p = s.player;
+    const report = stDirectionReportText(p.location);
+    // The Output modifier consumes this queued snapshot exactly once.
+    // Save the rendered text NOW so later narration cannot change it.
+    s.pendingLookReport = {
+        text: stLookCompassText(p.location),
+        location: p.location,
+        response: s.playerResponses
+    };
+    stLog('LOOK', 'FREE ap=' + p.ap + ' loc=' + p.location + ' ' + report);
+    stLog('LOOK-QUEUE', 'response=' + s.playerResponses + ' location=' + p.location + ' directions=N,E,S,W');
+    stEvent('FREE LOOK: Focus your narration on the immediate chamber and visible openings; a verified North/East/South/West report will be appended by the script. Do not invent terrain beyond unexplored openings. No AP spent; do not move the player or draw a tile.');
+    return true;
+}
+
+function stCanAct(cost, action) {
+    const p = state.subterra.player;
+    if (p.hp <= 0) {
+        stLog('DENIED', action + ' unconscious');
+        stEvent('The player is unconscious and cannot perform this action.');
+        return false;
+    }
+    if (p.ap < cost) {
+        stLog('DENIED', action + ' cost=' + cost + ' ap=' + p.ap);
+        stEvent('The attempted ' + action + ' cannot happen: insufficient action points (' + p.ap + ' left).');
+        return false;
+    }
+    return true;
+}
+function spendAP(cost, action) {
+    const p = state.subterra.player;
+    p.ap -= cost;
+    stLog('AP', action + ' cost=' + cost + ' remaining=' + p.ap);
+}
+
+function stDamage(actor, amount, reason) {
+    if (!actor || actor.hp <= 0) return;
+    if (getTile(actor.location) && getTile(actor.location).type === 'Exit') return;
+    const before = actor.hp;
+    actor.hp = Math.max(0, actor.hp - amount);
+    stLog('HP', actor.name + ' ' + before + '->' + actor.hp + ' cause=' + reason);
+    stEvent(actor.name + ' loses ' + (before - actor.hp) + ' HP from ' + reason +
+        (actor.hp === 0 ? ' and falls unconscious.' : '.'));
+}
+function stAllActors() {
+    const s = state.subterra;
+    return [s.player].concat(s.npcs);
+}
+function stNormalizeDirection(raw) {
+    const dict = { n: 'N', north: 'N', e: 'E', east: 'E',
+        s: 'S', south: 'S', w: 'W', west: 'W' };
+    return dict[String(raw || '').trim().toLowerCase()] || null;
+}
+
+// Player movement: validate source, target, legal AP, then draw/enter.
+// Every successful explore or ordinary move costs 1 AP. Entering an
+// existing flooded/squeeze tile costs 2 AP (Swim/Squeeze equivalent).
+function move(rawDirection) {
+    const s = state.subterra, p = s.player;
+    const direction = stNormalizeDirection(rawDirection);
+    if (!direction) { stEvent('Movement needs N, E, S, or W.'); return false; }
+    const source = getTile(p.location);
+    const destination = stStep(p.location, direction);
+    stLog('MOVE-REQ', 'from=' + p.location + ' dir=' + direction + ' dest=' + destination);
+    if (!source || !destination || !source.Exits.includes(direction)) {
+        stEvent('No traversable opening leads ' + direction + ' from here.');
+        return false;
+    }
+    if (!source.rope && source.type === 'Ledge' && source.arrowDirection === direction) {
+        stEvent('An unroped ledge prevents travel in that direction.'); return false;
+    }
+    if (!source.rope && source.type === 'Slide' &&
+        ST_OPP[source.arrowDirection] === direction) {
+        stEvent('The slide cannot be climbed backward without a rope.'); return false;
+    }
+    let target = getTile(destination);
+    if (target && !stValidConnection(source, target, direction)) {
+        stEvent('The passages do not connect in that direction.'); return false;
+    }
+    if (target && target.collapsed) {
+        stEvent('Rubble blocks the passage; clear it before entering.'); return false;
+    }
+    const cost = target && (target.flooded || target.type === 'Squeeze') ? 2 : 1;
+    if (!stCanAct(cost, 'move')) return false;
+    const discovering = !target;
+    if (!target) target = drawTile(destination, direction);
+    if (!target) { stEvent('No cave tile can be revealed in that direction.'); return false; }
+    const origin = p.location;
+    spendAP(cost, discovering ? 'explore' : 'move');
+    p.location = destination;
+    s.pathHistory.push(destination);
+    if (s.pathHistory.length > 30) s.pathHistory.shift();
+    stEvent('Player moves ' + direction + ' from ' + origin + ' into ' +
+        target.type + ' tile ' + destination + (discovering ? ' (newly explored).' : '.'));
+    stLog('MOVE', origin + '->' + destination + ' tile=' + target.type);
+    // Rough ground and active gas resolve immediately upon entry.
+    if (target.type === 'Rough Terrain' && !stSkillCheck('rough terrain')) {
+        stDamage(p, 1, 'unstable rough terrain');
+    }
+    if (target.activeGas) stDamage(p, 2, 'active gas');
+    if (target.horror) stDamage(p, p.hp, 'encountering a Horror');
+    if (target.type === 'Exit') {
+        s.exitFound = true;
+        stEvent('The player finds the Exit tile. Reaching it does NOT automatically end the adventure; the player must attempt #escape.');
+    }
+    // The central main() dispatcher checks for AP==0 AFTER move()
+    // finishes tile effects. Do not end the round here or in spendAP().
+    return true;
+}
+
+// Optional Sub Terra Reveal action (draw but do not enter), cost 1 AP.
+function reveal(rawDirection) {
+    const p = state.subterra.player;
+    const direction = stNormalizeDirection(rawDirection);
+    const from = getTile(p.location);
+    const dest = stStep(p.location, direction);
+    if (!direction || !dest || !from || !from.Exits.includes(direction) || getTile(dest)) {
+        stEvent('Cannot reveal a cave tile in that direction.'); return false;
+    }
+    if (!stCanAct(1, 'reveal')) return false;
+    const tile = drawTile(dest, direction);
+    if (!tile) { stEvent('There are no compatible tiles left to reveal.'); return false; }
+    spendAP(1, 'reveal');
+    stEvent('The player reveals an adjacent ' + tile.type + ' tile to the ' + direction +
+        ' at ' + dest + ' without entering it.');
+    return true;
+}
+
+// Rest is implemented as original Heal: spend 2 AP to recover 1 HP.
+function rest() {
+    const p = state.subterra.player;
+    if (p.hp >= p.maxHP) { stEvent('The player is already at full health.'); return false; }
+    if (!stCanAct(2, 'rest/heal')) return false;
+    spendAP(2, 'rest/heal');
+    p.hp++;
+    stEvent('The player tends injuries and recovers 1 HP (' + p.hp + '/' + p.maxHP + ').');
+    stLog('HEAL', 'player hp=' + p.hp);
+    return true;
+}
+function hide() {
+    const p = state.subterra.player;
+    if (!stCanAct(2, 'hide')) return false;
+    spendAP(2, 'hide');
+    p.hiding = stSkillCheck('hide');
+    stEvent(p.hiding
+        ? 'The player finds concealment; Horrors will not select the player as a target this round.'
+        : 'The player attempts to hide but fails to gain reliable concealment.');
+    return p.hiding;
+}
+function placeRope() {
+    const p = state.subterra.player;
+    const tile = getTile(p.location);
+    if (!tile || !['Ledge', 'Slide'].includes(tile.type)) {
+        stEvent('Ropes can only be placed on a ledge or slide tile.'); return false;
+    }
+    if (tile.rope) { stEvent('This passage already has a rope.'); return false; }
+    if (!stCanAct(2, 'place rope')) return false;
+    spendAP(2, 'place rope');
+    const success = stSkillCheck('place rope');
+    if (success) tile.rope = true;
+    stEvent(success ? 'The player secures a rope across this obstacle.'
+        : 'The player fails to secure the rope.');
+    return success;
+}
+function stDig(direction) {
+    const p = state.subterra.player;
+    const dir = direction && stNormalizeDirection(direction);
+    if (direction && !dir) { stEvent('Dig direction must be N, E, S, or W.'); return false; }
+    const targetCoord = dir ? stStep(p.location, dir) : p.location;
+    const current = getTile(p.location);
+    const tile = getTile(targetCoord);
+    if (!tile || !tile.collapsed || (dir && !stValidConnection(current, tile, dir))) {
+        stEvent('There is no reachable rubble to dig out there.'); return false;
+    }
+    if (!stCanAct(2, 'dig')) return false;
+    spendAP(2, 'dig');
+    tile.collapsed = false; // Hazard eligibility index remains permanent.
+    stEvent('Rubble is cleared at ' + targetCoord + '; the passage opens again.');
+    stLog('DIG', 'cleared=' + targetCoord + ' indexRetained=true');
+    return true;
+}
+
+// Exertion is 0 AP, grants +1 AP, and risks 1 HP at round end.
+// Because rounds now advance immediately at AP=0, #exert must be used
+// BEFORE spending the final ordinary action point. Once per round.
+function exert() {
+    const p = state.subterra.player;
+    if (p.hp <= 0 || p.exertUsed || p.ap <= 0) {
+        stLog('EXERT-DENIED', 'hp=' + p.hp + ' used=' + p.exertUsed + ' ap=' + p.ap);
+        stEvent('Exertion must be declared before spending your final AP and can only be used once per round.');
+        return false;
+    }
+    p.exertUsed = true;
+    p.ap += 1;
+    stEvent('The player exerts themself, gaining one additional AP; strain will be checked at the end of the round.');
+    stLog('EXERT', 'granted=1 ap=' + p.ap + ' pendingD6=true');
+    return true;
+}
+
+// Exit attempt is unlocked by discovering/reaching the genuine Exit tile.
+// NO minimum player response count, maximum response count, or artificial
+// flashlight failure. More elaborate escape requirements remain optional.
+function stEscape() {
+    const s = state.subterra, p = s.player;
+    if (!getTile(p.location) || getTile(p.location).type !== 'Exit') {
+        stEvent('The player has not reached an actual viable exit tile.');
+        stLog('ESCAPE', 'DENIED: not on Exit');
+        return false;
+    }
+    if (!stCanAct(1, 'escape')) return false;
+    spendAP(1, 'escape');
+    s.exited = true;
+    stEvent('The player completes the final ascent and escapes the cave. The primary objective succeeds.');
+    stLog('ESCAPE', 'SUCCESS at location=' + p.location);
+    return true;
+}
+
+// Role-specific skill and fighting rules have not been specified yet.
+// These deliberately do NOT spend AP or invent abilities.
+function useSkill() {
+    stLog('SKILL', 'pending implementation role=' + state.subterra.player.role);
+    stEvent('This specialist ability is not yet implemented in the prototype.');
+    return false;
+}
+function fight() {
+    stLog('FIGHT', 'pending custom rules');
+    stEvent('Combat against a Horror is not yet implemented; do not invent a successful attack.');
+    return false;
+}
+
+// Returns passable neighbor coordinates with open exits BOTH ways.
+function stNeighbors(coord) {
+    const tile = getTile(coord);
+    if (!tile) return [];
+    const list = [];
+    for (const d of tile.Exits) {
+        const next = stStep(coord, d);
+        if (next && stValidConnection(tile, getTile(next), d)) list.push(next);
+    }
+    return list;
+}
+// BFS shortest cave path; Horrors ignore terrain hazards but not walls.
+function stPath(from, to, maxSteps) {
+    if (from === to) return [from];
+    const queue = [[from]], seen = new Set([from]);
+    for (let qi = 0; qi < queue.length; qi++) {
+        const path = queue[qi];
+        if (path.length - 1 >= (maxSteps || 80)) continue;
+        for (const next of stNeighbors(path[path.length - 1])) {
+            if (seen.has(next)) continue;
+            const newPath = path.concat([next]);
+            if (next === to) return newPath;
+            seen.add(next); queue.push(newPath);
+        }
+    }
+    return null;
+}
+
+// ============================================================== 
+// AUTONOMOUS NPC PHASE - RULE-LIMITED PROTOTYPE (v0.3.2)
+// ============================================================== 
+// Each living specialist gets 2 NPC AP on each expedition round.
+// They use ONLY previously discovered, connected map tiles; the NPC
+// phase NEVER draws tiles or changes the player's destination.
+// Medic: when co-located with an injured teammate, heal 1 HP for 2 AP.
+// All other behavior: follow an explored route toward the player,
+// paying 1 AP per normal tile / 2 AP for squeeze or flooded tile.
+// Unsafe routes (collapse, active gas, Horror) are not entered on
+// purpose. Character-specific skills will be added when defined.
+// A few concise events describe NPC movement; fine-grained decisions
+// are logged for debugging. Return a phase summary for diagnostics.
+function stNpcLegalStep(fromCoord, toCoord, remainingAP) {
+    const tile = getTile(toCoord), from = getTile(fromCoord);
+    const direction = ST_DIRS.find(d => stStep(fromCoord, d) === toCoord);
+    if (!tile || !from || !direction || !stValidConnection(from, tile, direction)) {
+        return { ok:false, reason:'DISCONNECTED' };
+    }
+    if (tile.collapsed || tile.horror || tile.activeGas) {
+        return { ok:false, reason:tile.collapsed ? 'COLLAPSE' : tile.horror ? 'HORROR' : 'GAS' };
+    }
+    if (!from.rope && from.type === 'Ledge' && from.arrowDirection === direction) {
+        return { ok:false, reason:'UNROPED_LEDGE' };
+    }
+    if (!from.rope && from.type === 'Slide' && ST_OPP[from.arrowDirection] === direction) {
+        return { ok:false, reason:'UNROPED_SLIDE' };
+    }
+    const cost = tile.flooded || tile.type === 'Squeeze' ? 2 : 1;
+    return cost <= remainingAP ? {ok:true, cost} : {ok:false, reason:'AP_SHORT', cost};
+}
+
+// A safe-path BFS is separate from Horror pathfinding: monsters can
+// take risks that autonomous NPCs avoid. This prevents one blocked
+// shortest path from trapping an NPC when a safe alternate route exists.
+function stNpcSafePath(from, to, limit) {
+    if (from === to) return [from];
+    const queue = [[from]], seen = new Set([from]);
+    for (let i = 0; i < queue.length; i++) {
+        const path = queue[i], at = path[path.length - 1];
+        if (path.length - 1 >= (limit || 80)) continue;
+        for (const next of stNeighbors(at)) {
+            if (seen.has(next) || !stNpcLegalStep(at, next, 2).ok) continue;
+            const updated = path.concat([next]);
+            if (next === to) return updated;
+            seen.add(next);
+            queue.push(updated);
+        }
+    }
+    return null;
+}
+
+function npcTurn() {
+    const s = state.subterra;
+    const report = { moved:0, healed:0, held:0, skipped:0 };
+    stLog('NPC-PHASE', 'BEGIN round=' + s.round + ' count=' + s.npcs.length);
+    const progress = [];
+    for (const npc of s.npcs) {
+        const origin = npc.location;
+        let ap = 2, steps = 0, healed = '';
+        stLog('NPC-TURN-START', 'role=' + npc.role + ' hp=' + npc.hp + ' loc=' + origin + ' ap=' + ap);
+        if (npc.hp <= 0) {
+            report.skipped++;
+            stLog('NPC-TURN-END', 'role=' + npc.role + ' unconscious; skip');
+            continue;
+        }
+        // Healing does not spend the PLAYER's AP. Only a co-located
+        // Medic may help; prioritize the most injured living actor.
+        if (npc.role === 'Medic') {
+            const injured = stAllActors().filter(a => a !== npc && a.hp > 0 &&
+                a.hp < a.maxHP && a.location === npc.location)
+                .sort((a,b) => (a.hp / a.maxHP) - (b.hp / b.maxHP));
+            if (injured.length) {
+                const target = injured[0];
+                const oldHP = target.hp;
+                target.hp = Math.min(target.maxHP, target.hp + 1);
+                ap -= 2;
+                healed = target.name || target.role || 'teammate';
+                report.healed++;
+                stLog('NPC-ACTION', 'Medic HEAL target=' + healed +
+                    ' hp=' + oldHP + '->' + target.hp + ' cost=2 remaining=' + ap);
+                stEvent('The Medic treats ' + healed + ' and restores 1 HP.');
+            }
+        }
+        if (ap > 0 && npc.location !== s.player.location) {
+            const path = stNpcSafePath(npc.location, s.player.location, 80);
+            if (!path) {
+                stLog('NPC-ACTION', npc.role + ' HOLD reason=NO_KNOWN_PATH');
+            } else {
+                for (let i=1; i<path.length && ap>0; i++) {
+                    const next=path[i];
+                    const check=stNpcLegalStep(npc.location, next, ap);
+                    if (!check.ok) {
+                        stLog('NPC-ACTION', npc.role + ' HOLD next=' + next + ' reason=' + check.reason + ' ap=' + ap);
+                        break;
+                    }
+                    const previous=npc.location;
+                    npc.location=next;
+                    ap-=check.cost;
+                    steps++;
+                    stLog('NPC-ACTION', npc.role + ' MOVE ' + previous + '->' + next +
+                        ' cost=' + check.cost + ' remaining=' + ap);
+                    if (npc.location === s.player.location) break;
+                }
+            }
+        }
+        if (steps) {
+            report.moved++;
+            progress.push(npc.role + ' follows through charted passages toward the player');
+        } else if (!healed) report.held++;
+        stLog('NPC-TURN-END', 'role=' + npc.role + ' apLeft=' + ap +
+            ' steps=' + steps + ' hp=' + npc.hp + ' ' + origin + '->' + npc.location +
+            (healed ? ' healed=' + healed : ''));
+    }
+    if (progress.length) stEvent('On the NPC turn: ' + progress.join('; ') + '.');
+    stLog('NPC-PHASE', 'END round=' + s.round + ' moved=' + report.moved +
+        ' healed=' + report.healed + ' held=' + report.held + ' skipped=' + report.skipped);
+    return report;
+}
+
+function stClosestVictim(from) {
+    const s = state.subterra;
+    let best = null;
+    for (const actor of stAllActors()) {
+        if (actor.hp <= 0 || actor.hiding) continue;
+        if (getTile(actor.location) && getTile(actor.location).type === 'Exit') continue;
+        const path = stPath(from, actor.location, 7);
+        if (path && (!best || path.length < best.path.length)) best = { actor, path };
+    }
+    return best;
+}
+
+// Horror tokens are independently stored as positions; tile.horror
+// is updated for immediate entry checks, and type='Horror' is an index.
+function stHorrorPhase() {
+    const s = state.subterra;
+    for (const origin of s.horrors.slice()) {
+        const victim = stClosestVictim(origin);
+        const ix = s.horrors.indexOf(origin);
+        if (ix < 0) continue;
+        if (!victim) {
+            const t = getTile(origin); if (t) t.horror = false;
+            s.horrors.splice(ix, 1);
+            stLog('HORROR', 'vanished from ' + origin + ' no victim within 7');
+            continue;
+        }
+        const dest = victim.path[1] || origin;
+        const oldTile = getTile(origin), newTile = getTile(dest);
+        if (oldTile) oldTile.horror = false;
+        s.horrors[ix] = dest;
+        if (newTile) newTile.horror = true;
+        stLog('HORROR', origin + '->' + dest + ' target=' + victim.actor.name);
+        stEvent('A Horror moves through connected passages from ' + origin + ' to ' + dest + '.');
+        for (const actor of stAllActors()) {
+            if (actor.location === dest && actor.hp > 0) stDamage(actor, actor.hp, 'Horror contact');
+        }
+    }
+}
+function stSpawnHorror() {
+    const s = state.subterra;
+    if (s.horrors.length >= 3) return;
+    let nearest = null;
+    for (const coord of s.hazardLocations.horror) {
+        const tile = getTile(coord);
+        if (!tile || tile.horror) continue;
+        const victim = stClosestVictim(coord);
+        if (victim && (!nearest || victim.path.length < nearest.path.length)) {
+            nearest = { coord, path: victim.path };
+        }
+    }
+    if (!nearest) { stLog('HORROR', 'no eligible spawn within 7'); return; }
+    s.horrors.push(nearest.coord);
+    getTile(nearest.coord).horror = true;
+    stLog('HORROR', 'spawn=' + nearest.coord + ' count=' + s.horrors.length);
+    stEvent('A Horror emerges at ' + nearest.coord + '.');
+    for (const actor of stAllActors()) {
+        if (actor.location === nearest.coord && actor.hp > 0) stDamage(actor, actor.hp, 'Horror spawning nearby');
+    }
+}
+
+// Global active gas ends at next hazard phase; flooded and collapsed
+// flags persist until a specific clearing action.
+function stClearGas() {
+    const s = state.subterra;
+    if (!s.gasActive) return;
+    s.gasActive = false;
+    for (const coord of s.hazardLocations.gas) {
+        const tile = getTile(coord);
+        if (tile) tile.activeGas = false;
+    }
+    stLog('GAS', 'expired for ' + s.hazardLocations.gas.length + ' registered tiles');
+}
+function stResolveHazard(card) {
+    const s = state.subterra;
+    stLog('HAZARD', 'DRAW=' + card.type + ' round=' + s.round);
+    stEvent('Hazard phase: ' + card.type + '.');
+    if (card.type === 'Tremor') {
+        for (const actor of stAllActors()) {
+            if (actor.hp > 0 && !stSkillCheck('Tremor ' + actor.name)) stDamage(actor, 1, 'a tremor');
+        }
+    } else if (card.type === 'Flood') {
+        for (const coord of s.hazardLocations.flooded) {
+            const tile = getTile(coord); if (tile) tile.flooded = true;
+        }
+        for (const actor of stAllActors()) {
+            if (actor.hp > 0 && getTile(actor.location) && getTile(actor.location).flooded) {
+                stDamage(actor, 1, 'rising floodwater');
+            }
+        }
+    } else if (card.type === 'Gas') {
+        s.gasActive = true;
+        for (const coord of s.hazardLocations.gas) {
+            const tile = getTile(coord); if (tile) tile.activeGas = true;
+        }
+        for (const actor of stAllActors()) {
+            const tile = getTile(actor.location);
+            if (actor.hp > 0 && tile && tile.activeGas) stDamage(actor, 2, 'poisonous gas');
+        }
+    } else if (card.type === 'Cave-In') {
+        const die = rollD6('cave-in hazard');
+        for (const coord of s.hazardLocations.collapsed) {
+            const tile = getTile(coord);
+            if (!tile || tile.collapsed || !tile.collapseRolls.includes(die)) continue;
+            tile.collapsed = true;
+            stEvent('The cave-in passage at ' + coord + ' collapses.');
+            for (const actor of stAllActors()) {
+                if (actor.hp > 0 && actor.location === coord) stDamage(actor, 3, 'falling rock');
+            }
+        }
+    } else if (card.type === 'Horror') {
+        stHorrorPhase(); // Additional move from this hazard card.
+        stSpawnHorror();
+    }
+}
+function stDrawHazard() {
+    const s = state.subterra;
+    // This prototype DOES NOT recycle the finite deck, kill the lights,
+    // or declare victory/defeat automatically. Endgame is undecided.
+    if (!s.hazardDeck.length) {
+        if (!s.hazardDepleted) {
+            s.hazardDepleted = true;
+            stLog('HAZARD-EMPTY', 'finite hazard deck exhausted; no endgame outcome assigned');
+            stEvent('The hazard deck is exhausted; no further hazard card is drawn. No automatic endgame consequence is assigned yet.');
+        } else {
+            stLog('HAZARD-EMPTY', 'remains empty; no card drawn');
+        }
+        return;
+    }
+    const card = s.hazardDeck.pop();
+    if (card) {
+        s.hazardDiscard.push(card);
+        stResolveHazard(card);
+        if (!s.hazardDeck.length) stLog('HAZARD-EMPTY', 'last card drawn this round; exhaustion next round');
+    }
+}
+
+// ============================================================== 
+// ROUND ADVANCEMENT - AUTOMATIC AT ZERO PLAYER AP (v0.3.2)
+// ============================================================== 
+// Run this phase exactly once per round, AFTER the player action and
+// its tile effects have completed. Strict order:
+//   exertion strain -> each NPC turn -> Horror movement -> expire gas
+//   -> draw/resolve ONE hazard -> reset player's AP -> next round.
+// The hazard card is drawn before AP is reset. #endturn may end early.
+// Guards prevent repeated Context/Output invocations from redrawing.
+function stEndTurn(reason) {
+    const s = state.subterra, p = s.player;
+    const resolvingRound = s.round;
+    if (s.roundResolving || s.lastResolvedRound === resolvingRound) {
+        stLog('ROUND-GUARD', 'SKIP round=' + resolvingRound + ' resolving=' + s.roundResolving +
+            ' last=' + s.lastResolvedRound);
+        return false;
+    }
+    if (s.exited) {
+        stLog('ROUND-GUARD', 'SKIP completed escape');
+        return false;
+    }
+    s.roundResolving = true;
+    stLog('ROUND-END', 'BEGIN round=' + resolvingRound + ' reason=' + (reason || 'MANUAL') +
+        ' AP=' + p.ap + ' exert=' + p.exertUsed + ' response=' + s.playerResponses);
+    try {
+        if (p.exertUsed && !stSkillCheck('exertion strain')) stDamage(p, 1, 'overexertion');
+        npcTurn();
+        stHorrorPhase();
+        stClearGas();
+        stDrawHazard();
+        // Mark the round completed before reset; further Output passes
+        // on the same submission must NOT resolve the same phase twice.
+        s.lastResolvedRound = resolvingRound;
+        s.round = resolvingRound + 1;
+        p.ap = p.maxAP;
+        p.exertUsed = false;
+        p.hiding = false;
+        for (const npc of s.npcs) npc.hiding = false;
+        stEvent('The next round begins; the player has ' + p.ap + ' AP.');
+        stLog('ROUND-START', 'round=' + s.round + ' AP=' + p.ap +
+            ' playerHP=' + p.hp + ' tilesLeft=' + s.tileDeck.length +
+            ' hazardsLeft=' + s.hazardDeck.length);
+        return true;
+    } finally {
+        s.roundResolving = false;
+    }
+}
+
+// Called AFTER main() finishes an AP-spending action, whether it was
+// triggered by explicit input, clear language, or deferred AI intent.
+// A failed die roll still ends a round if it spent the final AP;
+// invalid commands and free actions do not trigger a new round.
+function stMaybeAutoEndRound(command, apBefore) {
+    const s = state.subterra, p = s.player;
+    const spent = p.ap < apBefore;
+    stLog('ROUND-CHECK', 'command=' + command + ' ap=' + apBefore + '->' + p.ap +
+        ' spent=' + spent + ' auto=' + (spent && p.ap === 0 && !s.exited));
+    if (spent && p.ap === 0 && !s.exited) {
+        return stEndTurn('AUTO_AP_ZERO:' + command);
+    }
+    return false;
+}
+
+function helpMenu() {
+    const msg = '#look (free), #move N/E/S/W, #reveal N/E/S/W, #rest, #hide, #rope, #dig [N/E/S/W], ' +
+        '#exert (declare BEFORE final AP), #endturn (optional early end), #status, ' +
+        '#escape (from Exit tile). Round ends automatically at AP=0. ' +
+        '#skill and #fight are reserved for later rules.';
+    stLog('HELP', 'displayed');
+    stEvent('Present available mechanical commands briefly: ' + msg);
+    return msg;
+}
+function stStatus() {
+    const s = state.subterra, p = s.player, tile = getTile(p.location);
+    const exits = tile ? tile.Exits.join(',') : '?';
+    const status = 'HP=' + p.hp + '/' + p.maxHP + ', AP=' + p.ap + ', round=' + s.round +
+        ', room=' + p.location + ' (' + (tile ? tile.type : '?') + '), exits=' + exits +
+        ', drawn=' + (65 - s.tileDeck.length) + ', hazards=' + s.hazardDeck.length + '.';
+    stLog('STATUS', status);
+    stEvent('The player checks their current condition: ' + status);
+    return status;
+}
+
+// ==============================================================
+// HYBRID INTENT DETECTION (v0.3)
+// ==============================================================
+// Stage 1 is deterministic: explicit #commands, then a small set of
+// extremely clear first-person physical actions. Stage 2 is semantic:
+// the storyteller emits ONE intent tag for a *possible* mechanical
+// request, which Output validates before executing. Uncertain tags
+// never spend AP or change the world. Only one action per submission.
+//
+// In Say mode, execute ONLY an unequivocal first-person *team directive*
+// such as "Let's head east". Do not execute suggestions, conditionals,
+// questions, NPC orders or ordinary descriptions of a possible route.
+// A correction such as "East...I said lets go to the east" is also a
+// definite direction, provided the repeated directions agree.
+function stDetectSpokenTeamMove(utterance) {
+    let t=String(utterance||'').trim().replace(/[;.!]+$/g,'').trim();
+    if (!t || /\?/.test(t) || /\b(?:not|never|don't|dont|won't|wont|can't|cannot|stop|avoid|refuse|maybe|perhaps|might|could|should|would|if|unless|suppose|imagine|consider|suggest|think|wonder)\b/i.test(t)) return null;
+    // Permit harmless leading affirmations; these caused false negatives.
+    t=t.replace(/^(?:(?:fine|ok(?:ay)?|alright|right|well|then|agreed|everyone|team|folks)\b[\s,!.:-]*){1,3}/i,'').trim();
+    let repeated=null;
+    const correction=/^(north|east|south|west)\s*(?:\.{2,}|[,;:!])\s*i\s+said\s*,?\s*(.+)$/i.exec(t);
+    if (correction) {repeated=stNormalizeDirection(correction[1]);t=correction[2].trim();}
+    t=t.replace(/^i\s+said\s*,?\s*/i,'');
+    const directive=/^let['’]?s\s+(?:go|head|move|walk|travel|proceed|advance)\s+(?:(?:to|towards?|into|down|along)\s+)?(?:the\s+)?(north|east|south|west|n|e|s|w)(?:\s+(?:passage|tunnel|corridor|way))?$/i.exec(t);
+    const decision=/^(north|east|south|west)\s+(?:it\s+is|it['’]?s\s+going\s+to\s+be|is\s+the\s+way)(?:\s+then)?$/i.exec(t);
+    const direction=stNormalizeDirection((directive||decision||[])[1]);
+    if (!direction || (repeated && repeated!==direction)) return null;
+    return {command:'move',argument:direction,reason:directive?'spoken team movement directive':'spoken committed direction'};
+}
+
+// Return values from stDetectObviousIntent:
+// {command,argument,reason} - safe to execute NOW in Input.
+// null                      - not sufficiently clear; consider AI.
+// Say-mode directives are recognized separately from Do actions;
+// quoted general dialogue is never converted into movement.
+function stDetectObviousIntent(utterance, mode) {
+    const t = String(utterance || '').trim().replace(/[.;!]+$/g, '').trim();
+    if (!t || mode === 'story') return null;
+    if (mode === 'say') return stDetectSpokenTeamMove(t);
+    if (/[?]/.test(t) || /\b(?:maybe|perhaps|might|could|should|would|if|unless|instead|suppose|imagine|consider|suggest|think|wonder|ask|tell)\b/i.test(t)) return null;
+    if (/\b(?:not|never|don't|dont|won't|wont|can't|cannot|stop|avoid|refuse)\b/i.test(t)) return null;
+    // Do not fire from quoted NPC dialogue or a multi-action statement.
+    if (/^["“']/.test(t) || /["“”]/.test(t) || /\b(?:then|after that|before that)\b/i.test(t)) return null;
+    const looking = /^(?:(?:i|we|you)\s+)?(?:look\s+around|look\s+about|survey\s+(?:the\s+)?(?:area|chamber|room|surroundings)|scan\s+(?:the\s+)?(?:area|chamber|room|surroundings)|check\s+(?:the\s+)?(?:exits|directions|passages)|look\s+for\s+(?:exits|passages))$/i;
+    if (looking.test(t)) return { command: 'look', argument: '', reason: 'clear observation' };
+    const go = /^(?:(?:i|we|you)\s+|let['’]?s\s+)?(?:go|move|walk|head|travel|proceed|advance)\s+(?:to\s+|towards?\s+|into\s+)?(?:the\s+)?(north|east|south|west|n|e|s|w)$/i;
+    const m = go.exec(t);
+    if (m) return { command: 'move', argument: stNormalizeDirection(m[1]), reason: 'clear cardinal movement' };
+    const restMatch = /^(?:(?:i|we|you)\s+)?(?:rest|take\s+a\s+rest|stop\s+to\s+rest|tend\s+my\s+wounds)$/i;
+    if (restMatch.test(t)) return { command: 'rest', argument: '', reason: 'clear rest request' };
+    const hideMatch = /^(?:(?:i|we|you)\s+)?(?:hide|try\s+to\s+hide|take\s+cover|seek\s+cover)$/i;
+    if (hideMatch.test(t)) return { command: 'hide', argument: '', reason: 'clear concealment request' };
+    const ropeMatch = /^(?:(?:i|we|you)\s+)?(?:place|secure|set|attach)\s+(?:a\s+|the\s+)?rope(?:\s+(?:here|on\s+the\s+(?:ledge|slide)))?$/i;
+    if (ropeMatch.test(t)) return { command: 'rope', argument: '', reason: 'clear rope request' };
+    // Skills and fighting are not fully implemented yet. We still route
+    // confidently phrased #skill/#fight to the placeholders for logs.
+    const skillMatch = /^(?:(?:i|we|you)\s+)?(?:use|activate)\s+(?:my\s+|the\s+)?(?:specialist\s+)?skill$/i;
+    if (skillMatch.test(t)) return { command: 'skill', argument: '', reason: 'explicit skill intent in prose' };
+    const fightMatch = /^(?:(?:i|we|you)\s+)?(?:fight|attack)\s+(?:the\s+)?(?:horror|monster|creature)$/i;
+    if (fightMatch.test(t)) return { command: 'fight', argument: '', reason: 'clear fight intent' };
+    return null;
+}
+
+// Broad *candidate* detector only; this NEVER executes an action.
+// Its purpose is to avoid making the AI classify every ordinary chat
+// turn. False candidates cost no AP; the AI may return NONE.
+function stMayNeedAiIntent(utterance, mode) {
+    const t=String(utterance||'').trim();
+    if (!t || mode==='story') return false;
+    // Queries, NPC-only orders and speculative advice are conversation,
+    // not the player's own mechanical action. Speech still reaches NPCs.
+    if (/\?/.test(t) || /^(?:maybe|perhaps|should\s+we|could\s+we|what\s+about|i\s+(?:suggest|think|wonder)|(?:tell|ask)\s+\w+)/i.test(t)) return false;
+    if (/\b(?:don't|dont|not|never|won't|wont|can't|cannot|if\s+we)\b/i.test(t)) return false;
+    // Say-mode cardinal decisions can be indirect: 'East it is then',
+    // 'We'll take the passage east', 'East. Let's do it'. Send unclear
+    // ones to AI instead of automatically declaring NARRATIVE_ONLY.
+    if (mode==='say') return /\b(?:north|east|south|west|northern|southern|eastern|western|go|head|move|travel|proceed|take\s+(?:the|that)\s+passage|let['’]?s|we['’]?ll|we\s+are\s+going|rest|hide|rope|fight)\b/i.test(t);
+    return /\b(?:head|go|walk|move|travel|proceed|advance|follow|make\s+(?:my|our)\s+way|venture|enter|leave|climb|crawl|scramble|squeeze|creep|duck|push|look|survey|scan|inspect|examine|directions|exits|rest|heal|recover|bandage|hide|sneak|conceal|cover|rope|tie|secure|anchor|skill|expertise|training|treat|fight|attack|strike|shoot|defend|north|east|south|west)\b/i.test(t);
+}
+
+// Speech is data, never a substitute for the player's mechanical action.
+// SAY-mode always preserves the exact utterance. Mixed DO mode only
+// captures text explicitly framed as words spoken by the player.
+function stPlayerSpeech(utterance, mode) {
+    const t=String(utterance||'').trim();
+    if (mode==='say') {
+        const quoted=/^[\"“]([^\"”]+)[\"”]/.exec(t);
+        return quoted ? quoted[1] : t;
+    }
+    const m=/(?:^|[,;.]\s*)(?:i|you)\s+(?:say|tell\s+\w+|ask\s+\w+|shout|whisper|call\s+out)\s*[,:]?\s*["]([^"]+)["]/i.exec(t);
+    if (m) return m[1];
+    const n=/^["]([^"]+)["][,\s]+(?:i|you)\s+(?:say|shout|whisper|reply|tell)\b/i.exec(t);
+    return n ? n[1] : '';
+}
+
+// Validation is shared by explicit and AI-classified intents. The AI
+// only proposes action + argument. The script alone decides legality.
+function stAllowedAiIntent(action, arg) {
+    const a = String(action || '').toUpperCase(), val = String(arg || '').toUpperCase();
+    if (a === 'MOVE') return ST_DIRS.includes(val);
+    if (['LOOK','REST','ROPE','SKILL','HIDE','FIGHT'].includes(a)) return val === '-' || val === 'NONE';
+    return false;
+}
+
+// Short deterministic output after a *deferred AI decision*: the model
+// wrote BEFORE movement was resolved, so its speculative narrative is
+// not trustworthy. We replace it with map-grounded results instead of
+// letting invented rooms/creatures become canon. Subsequent narration
+// is free to embellish the new *verified* state.
+function stDeferredResultText(action, argument, before, after, committedEvents) {
+    const p = state.subterra.player;
+    const names = { N: 'north', E: 'east', S: 'south', W: 'west' };
+    const a = String(action || '').toUpperCase();
+    const events = Array.isArray(committedEvents) ? committedEvents : [];
+    if (a === 'MOVE') {
+        if (after.location !== before.location) {
+            const tile = getTile(after.location);
+            const type = tile ? tile.type : 'unknown';
+            let result = 'The expedition advances ' + (names[argument] || 'along the passage') + '. ' +
+                'The route leads into a ' + type.toLowerCase() + ' section of the cave.';
+            if (tile && tile.flooded) result += ' Water covers this passage.';
+            if (tile && tile.activeGas) result += ' Gas hangs dangerously in the air.';
+            if (tile && tile.collapsed) result += ' Fallen rock blocks passage.';
+            if (tile && tile.horror) result += ' A Horror is present.';
+            if (after.hp < before.hp) result += ' The passage causes injury.';
+            return result;
+        }
+        return 'The expedition does not advance ' + (names[argument] || '') + '. ' +
+            (events.length ? events[events.length - 1].replace(/\b[A-Z]{1,3}\d+\b/g, 'the passage') : 'The route cannot be traversed.');
+    }
+    if (a === 'LOOK') return 'Your headlamps sweep the nearby stone. The passages are charted below.';
+    if (a === 'REST') return after.hp > before.hp
+        ? 'A brief pause allows the wounds to be tended; some strength returns.'
+        : 'The team pauses, but no meaningful recovery is possible right now.';
+    if (a === 'HIDE') return p.hiding
+        ? 'Shadows and rock provide a moment of reliable concealment.'
+        : 'The attempt to conceal your position does not succeed.';
+    if (a === 'ROPE') return events.length
+        ? events[events.length - 1].replace(/\b[A-Z]{1,3}\d+\b/g, 'the passage')
+        : 'There is no suitable ledge or slide for securing a rope here.';
+    return events.length
+        ? events[events.length - 1].replace(/\b[A-Z]{1,3}\d+\b/g, 'the passage')
+        : 'No mechanical result can be resolved for that action yet.';
+}
+
+// Central dispatch for explicit #commands. A successful command is
+// processed exactly once, in INPUT, never re-parsed in CONTEXT/OUTPUT.
+// All command paths share this dispatcher, so automatic round ending
+// works for deterministic Input actions AND AI-confirmed Output actions.
+function main(command, argument) {
+    const s = stInit();
+    const beforeAP = s.player.ap;
+    stLog('MAIN', 'command=' + command + ' argument=' + (argument || '') +
+        ' ap=' + beforeAP + ' round=' + s.round);
+    if (s.exited && command !== 'status' && command !== 'help' && command !== 'look') {
+        stEvent('The expedition has already completed its escape. No further cave actions occur.');
+        return false;
+    }
+    let result;
+    switch (command) {
+        case 'move': result = move(argument); break;
+        case 'reveal': result = reveal(argument); break;
+        case 'rest': result = rest(); break;
+        case 'hide': result = hide(); break;
+        case 'rope': result = placeRope(); break;
+        case 'dig': result = stDig(argument); break;
+        case 'exert': result = exert(); break;
+        case 'endturn': return stEndTurn('MANUAL_ENDTURN');
+        case 'skill': result = useSkill(argument); break;
+        case 'fight': result = fight(argument); break;
+        case 'escape': result = stEscape(); break;
+        case 'status': result = stStatus(); break;
+        case 'look': result = lookAround(); break;
+        case 'help': result = helpMenu(); break;
+        default:
+            stEvent('Unknown command #' + command + '. Use #help for valid commands.');
+            stLog('COMMAND', 'unknown=' + command);
+            return false;
+    }
+    // Automatic round completion belongs HERE, not spendAP(), so a
+    // player who enters hazardous terrain first suffers its tile effects.
+    stMaybeAutoEndRound(command, beforeAP);
+    return result;
+}

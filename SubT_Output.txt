@@ -1,0 +1,289 @@
+// ==============================================================
+// SUB TERRA | OUTPUT MODIFIER | PROTOTYPE v0.4
+// ==============================================================
+// Output ONLY executes an action when Input explicitly queued a
+// PENDING_AI request and the model returns a valid CERTAIN tag.
+// It then clears the pending record, preventing action duplication
+// on Continue / Retry. The model's preliminary action narrative is
+// NOT trusted, because it was generated before the mechanics ran.
+
+// Return the last terminal metadata tag or null. Consume/scrub ALL
+// ST_INTENT-looking tags from visible narration, even when malformed.
+function stParseAiDecision(raw) {
+    const t = String(raw || '').trim();
+    const valid = /\[ST_INTENT\|(MOVE|LOOK|REST|ROPE|SKILL|HIDE|FIGHT|NONE|UNCERTAIN)\|(N|E|S|W|-|NONE)\|(CERTAIN|LOW)\]\s*$/i.exec(t);
+    const n = (t.match(/\[ST_INTENT\|/gi) || []).length;
+    const clean = t.replace(/\s*\[ST_INTENT\|[^\]\n]*\]/gi, '').trim();
+    if (n !== 1 || !valid) return { clean, valid:false, reason:n === 0 ? 'MISSING' : 'MULTIPLE_OR_MALFORMED' };
+    return {
+        clean, valid:true, action:valid[1].toUpperCase(),
+        arg:valid[2].toUpperCase(), confidence:valid[3].toUpperCase()
+    };
+}
+
+function stNpcClarifies() {
+    const s = state.subterra;
+    const nearby = s.npcs.find(n => n.hp > 0 && n.location === s.player.location);
+    const who = nearby ? nearby.role : 'A voice on the radio';
+    return who + ' pauses, watching for your signal. "Did you want us to do something specific, or are we staying here?"';
+}
+
+// ============================================================== 
+// GUARANTEED SINGLE, MAP-AUTHORITATIVE COMPASS REPORT (v0.3.1)
+// ============================================================== 
+// The model sometimes invents compass descriptions and repeats the
+// directions given in Context. The old exact-text check then appended
+// the correct map report AFTER the invented one, causing duplicates.
+//
+// On an actual LOOK response, remove model-authored compass reports
+// and any paragraph assigning directional details to unexplored areas.
+// Retain nondirectional atmosphere and NPC prose. Output then appends
+// exactly ONE map-generated compass snapshot from lookAround().
+// This sanitization DOES NOT run for non-LOOK actions.
+function stSanitizeLookNarration(raw) {
+    const original = String(raw || '').replace(/\r\n?/g, '\n');
+    let compassLines = 0;
+    const nonCompassLines = [];
+
+    const heading = /^\s*(?:[>|*\-]\s*)*the routes visible from here are\s*:\s*$/i;
+    const directionLine = /^\s*(?:[>|*\-]\s*)*(?:(?:north|east|south|west)|[NESW])\s*[:\-—|]\s*.+$/i;
+    for (const line of original.split('\n')) {
+        if (heading.test(line) || directionLine.test(line)) {
+            compassLines++;
+            continue;
+        }
+        nonCompassLines.push(line);
+    }
+
+    // Conservative guard: the storyteller is NOT allowed to assign
+    // distinct terrain, flooded areas, drops, squeezes, etc. to named
+    // compass passages unless the persistent map already confirms it.
+    // Rather than risk contradictory fragments, drop that paragraph.
+    const cardinal = /\b(?:north|south|east|west|northern|southern|eastern|western|northward|southward|eastward|westward)\b/i;
+    let directionalParagraphs = 0;
+    const safe = nonCompassLines.join('\n')
+        .split(/\n\s*\n/)
+        .filter(paragraph => {
+            if (!paragraph.trim()) return false;
+            if (cardinal.test(paragraph)) {
+                directionalParagraphs++;
+                return false;
+            }
+            return true;
+        })
+        .join('\n\n').trim();
+
+    return {
+        text: safe || 'The cave remains still around the expedition as the headlamps sweep over the surrounding stone.',
+        compassLines,
+        directionalParagraphs,
+        usedFallback: !safe
+    };
+}
+
+// When no player movement occurred, reject a clear but unauthorized
+// description of the player/whole expedition entering a new area.
+// Deliberately conservative: guard only obvious transitions and retain
+// independent NPC dialogue; don't try to parse every scenic metaphor.
+function stScrubFalsePlayerTravel(raw) {
+    const paragraphs=String(raw||'').split(/\n\s*\n/);
+    const transition=/\b(?:you|the expedition|the team|the group|everyone|you all)\b[^.!?\n]{0,110}\b(?:enter(?:s|ed)?|advance[ds]?|head(?:s|ed)?|walk(?:s|ed)?|move[ds]?|proceed[ds]?|follow(?:s|ed)?)\b[^.!?\n]{0,100}\b(?:chamber|room|passage|tunnel|cavern|north|south|east|west)\b/i;
+    let removed=0;
+    const safe=paragraphs.filter(p=>{
+        if (transition.test(p)) {removed++;return false;}
+        return true;
+    });
+    return {text:safe.join('\n\n').trim() || 'The expedition remains together in the current chamber.',removed};
+}
+
+// Model event receipts are claims, NOT proof of semantic accuracy.
+// Strip all metadata so the player never sees internal IDs/tags.
+function stReceipt(raw) {
+    const ids=[];
+    const clean=String(raw||'').replace(/\[ST_ACK\|([^\]\n]*)\]/gi,(all,list)=>{
+        for (const part of list.split(',')) {
+            const n=Number(part.trim());
+            if (Number.isInteger(n) && n>0 && !ids.includes(n)) ids.push(n);
+        }
+        return '';
+    });
+    return {clean,ids};
+}
+
+// A conservative fallback avoids losing important visible NPC/hazard
+// events. Never expose an unseen Horror or a hidden hazard card draw.
+// An ACK can fail to arrive despite good prose; recognize a few safely
+// visible event categories before appending a potentially repetitive line.
+function stEventSeemsNarrated(e, prose) {
+    const t=String(prose||'').toLowerCase();
+    if (e.kind==='MOVE') return /\b(?:advance[ds]?|move[ds]?|head(?:s|ed)?|go(?:es|ing)?|walk(?:s|ed)?|enter(?:s|ed)?|step(?:s|ped)?|follow(?:s|ed)?|travel(?:s|ed)?|lead(?:s|ing)?|continue[ds]?|proceed[ds]?)\b/i.test(t);
+    if (e.kind==='NPC') return /(?:leader|medic|climb(?:er|ing)|geologist|diver|bodyguard|explosives expert).{0,100}(?:follow|return|rejoin|catch up|move|walk|treat|bandage|heal|aid)/is.test(t);
+    if (e.kind==='HAZARD') return /(?:tremor|earthquake|ground shook|cave shook|rock shook|stone shudder|water surge|gas spread)/i.test(t);
+    if (e.kind==='THREAT') return /(?:horror|collapse|rockfall|stone fell|boulders fell)/i.test(t);
+    if (e.kind==='INJURY') return /(?:hurt|injur|bleed|wound|pain|blood)/i.test(t);
+    return false;
+}
+function stFinalizeEventDelivery(s, offeredIds, aiAcks, prose, deferred) {
+    const sync=stInitSync(s), report=[];
+    for (const ev of sync.pending) {
+        if (!offeredIds.includes(ev.id)) continue;
+        if (!ev.critical) {
+            stLog('EVENT-DELIVERY','id='+ev.id+' kind='+ev.kind+' status=NO_REQUIRED_FALLBACK visible='+ev.visible);
+            continue;
+        }
+        let how='FALLBACK';
+        if (aiAcks.includes(ev.id)) how='AI_ACK_CLAIM';
+        else if (stEventSeemsNarrated(ev,prose)) how='INFERRED_FROM_TEXT';
+        if (how==='FALLBACK' && ev.fallback) report.push(ev.fallback);
+        stLog('EVENT-DELIVERY','id='+ev.id+' kind='+ev.kind+' status='+how);
+    }
+    return report;
+}
+
+const modifier = (text) => {
+    const s = stInit();
+    const sync=stInitSync(s);
+    sync.phase='OUTPUT';
+    let out = typeof text === 'string' ? text : '';
+    const receipt=stReceipt(out);
+    out=receipt.clean;
+    const offeredIds=sync.offered.slice();
+    const decision = stParseAiDecision(out);
+    stLog('EVENT-RECEIPT','offered='+offeredIds.join(',')+' aiAck='+receipt.ids.join(','));
+    stLog('OUTPUT', 'length=' + out.length + ' events=' + s.events.length +
+        ' intent=' + (s.pendingIntent ? 'PENDING#' + s.pendingIntent.id : 'NONE') +
+        ' tag=' + (decision.valid ? decision.action + '/' + decision.arg + '/' + decision.confidence : decision.reason));
+
+    // Protect the script-authoritative ending WITHOUT a minimum turn
+    // count. Reaching the surface is allowed as soon as #escape truly
+    // succeeds on the actual Exit tile.
+    if (!s.exited) {
+        const unscriptedEscape = /you (?:finally )?(?:reach|made it to) the surface|you (?:finally )?escape(?:d)? the cave|you (?:step|emerge|stagger) (?:out )?into (?:the )?(?:daylight|sunlight|open air)|the (?:team|expedition) (?:finally )?(?:escapes|reaches) the surface/i;
+        if (unscriptedEscape.test(out)) {
+            stLog('ESCAPE-GUARD', 'unscripted escape blocked; no response-count test');
+            out = 'A seemingly promising route remains obstructed. The expedition has not reached a verified exit.';
+        }
+    }
+
+    // Consume the queued classification once and ONLY once.
+    if (s.pendingIntent && s.pendingIntent.status === 'PENDING_AI') {
+        const pending = s.pendingIntent;
+        s.pendingIntent = null; // mark consumed BEFORE any action function
+        const snapshot = { ap:s.player.ap, hp:s.player.hp, location:s.player.location };
+        if (!decision.valid) {
+            stLog('AI-TAG-MISSING', 'id=' + pending.id + ' reason=' + decision.reason + ' no action executed');
+            out = stNpcClarifies();
+            stLog('INTENT-CLARIFY', 'id=' + pending.id + ' reason=invalid/missing classifier tag');
+        } else if (decision.action === 'NONE' && decision.arg === '-' && decision.confidence === 'CERTAIN') {
+            out = decision.clean;
+            stLog('INTENT-NONE', 'id=' + pending.id + ' ordinary narrative; no action');
+        } else if (decision.action === 'UNCERTAIN' && decision.arg === '-' && decision.confidence === 'LOW') {
+            out = stNpcClarifies();
+            stLog('INTENT-CLARIFY', 'id=' + pending.id + ' classification=UNCERTAIN no AP spent');
+        } else if (decision.confidence === 'CERTAIN' &&
+                   stAllowedAiIntent(decision.action, decision.arg)) {
+            const cmd = decision.action.toLowerCase();
+            const arg = decision.arg === '-' || decision.arg === 'NONE' ? '' : decision.arg;
+            const eventStart = s.events.length;
+            stLog('INTENT-AI', 'id=' + pending.id + ' accepted=' + cmd + ' arg=' + arg +
+                ' input=' + JSON.stringify(pending.input.slice(0, 160)));
+            const returned = main(cmd, arg);
+            if (s.latestSubmission && s.latestSubmission.id===pending.id) {
+                Object.assign(s.latestSubmission,{action:decision.action,argument:arg,status:'EXECUTED',source:'AI',moved:snapshot.location!==s.player.location});
+            }
+            const aftermath = { ap:s.player.ap, hp:s.player.hp, location:s.player.location };
+            stLog('ACTION-RESULT', 'id=' + pending.id + ' source=AI action=' + cmd +
+                ' returned=' + returned + ' AP=' + snapshot.ap + '->' + aftermath.ap +
+                ' HP=' + snapshot.hp + '->' + aftermath.hp +
+                ' location=' + snapshot.location + '->' + aftermath.location);
+            // Rewrite provisional narration after mechanical resolution.
+            // Otherwise the AI might have invented a room before drawTile.
+            out = stDeferredResultText(decision.action, arg, snapshot, aftermath, s.events.slice(eventStart));
+            // The player's exact speech remains in adventure history.
+            // Do not replay it here, but let a nearby NPC acknowledge a
+            // committed spoken order after the verified result is known.
+            if (pending.spoken && decision.action==='MOVE' && snapshot.location!==aftermath.location) {
+                out = 'The Leader acknowledges your direction and signals the team onward.\n\n'+out;
+            }
+            // When a deferred action consumed the final AP, the NPC/hazard
+            // phase also ran in Output AFTER the model generated. Append
+            // verified event details now; otherwise Output clearing events
+            // would silently swallow the hazard outcome.
+            const extraEvents = s.events.slice(eventStart).filter(e =>
+                /^(?:Hazard phase:|On the NPC turn:|The Medic treats |The cave-in passage |A Horror |.* loses \d+ HP|The next round begins)/i.test(e));
+            if (extraEvents.length) {
+                out += '\n\n' + extraEvents.map(e => e.replace(/\b[A-Z]{1,3}\d+\b/g, 'a mapped passage')).join(' ');
+                stLog('DEFERRED-PHASE', 'id=' + pending.id + ' appendedEvents=' + extraEvents.length);
+            }
+            stLog('INTENT-EXEC', 'id=' + pending.id + ' action=' + cmd + ' provisional prose replaced');
+        } else {
+            out = stNpcClarifies();
+            stLog('INTENT-REJECT', 'id=' + pending.id + ' bad/conflicting action tag=' +
+                decision.action + '/' + decision.arg + '/' + decision.confidence);
+        }
+    } else {
+        // An accidental AI metadata tag on a nonpending turn MUST NOT
+        // execute anything. Strip it to avoid showing machine syntax.
+        if (decision.valid || /\[ST_INTENT\|/i.test(out)) {
+            stLog('INTENT-IGNORED', 'no queued pending input; stripped stray metadata');
+            out = decision.clean;
+        }
+    }
+
+    // HARD GUARANTEE: the AI can never supply the final compass data.
+    // Remove its versions (including paraphrases and unverified
+    // direction-specific prose), then append exactly ONE script-owned
+    // N/E/S/W snapshot. Works for Input look and AI-deferred look.
+    if (s.pendingLookReport && s.pendingLookReport.text) {
+        const requested = s.pendingLookReport;
+        const sanitized = stSanitizeLookNarration(out);
+        stLog('LOOK-SANITIZE', 'response=' + requested.response +
+            ' compassLinesRemoved=' + sanitized.compassLines +
+            ' directionalParagraphsRemoved=' + sanitized.directionalParagraphs +
+            ' fallback=' + sanitized.usedFallback);
+        out = sanitized.text + '\n\n' + requested.text;
+        stLog('LOOK-OUTPUT', 'AUTHORITATIVE response=' + requested.response +
+            ' at=' + requested.location + ' directions=N,E,S,W copies=1');
+        s.pendingLookReport = null;
+    }
+
+    if (s.latestSubmission && s.latestSubmission.action==='NONE' && !s.latestSubmission.moved) {
+        const guarded=stScrubFalsePlayerTravel(out);
+        if (guarded.removed) {
+            out=guarded.text;
+            stLog('GEOGRAPHY-GUARD','blockedUnsupportedPlayerTravel paragraphs='+guarded.removed);
+        }
+    }
+
+    // Durable narration receipt. Events produced during Output (the
+    // deferred-AI path) were invisible to the model; append essential
+    // facts immediately. Pre-generation events get an ACK/heuristic or
+    // short fallback. The ledger is drained ONCE after actual delivery.
+    const additional=sync.pending.filter(e=>e.createdBy==='OUTPUT').map(e=>e.id);
+    const allOffered=Array.from(new Set(offeredIds.concat(additional)));
+    const fallback=stFinalizeEventDelivery(s,allOffered,receipt.ids,out,true);
+    if (fallback.length) {
+        out += '\n\n'+Array.from(new Set(fallback)).join(' ');
+        stLog('NARRATION-FALLBACK','count='+fallback.length+' ids='+allOffered.join(','));
+    }
+    const beforePending=sync.pending.length;
+    sync.pending=sync.pending.filter(e=>!allOffered.includes(e.id));
+    sync.offered=[];
+    stLog('EVENT-LEDGER','delivered='+allOffered.length+' remaining='+sync.pending.length+' before='+beforePending);
+    if (s.latestSubmission) {
+        stLog('SPEECH-DELIVERY','id='+s.latestSubmission.id+' mode='+s.latestSubmission.mode+
+            ' spoken='+Boolean(s.latestSubmission.spoken)+' action='+s.latestSubmission.action);
+        s.latestSubmission=null; // never re-inject old speech on Continue
+    }
+
+    stLog('STATE', 'responses=' + s.playerResponses + ' round=' + s.round +
+        ' HP=' + s.player.hp + ' AP=' + s.player.ap +
+        ' loc=' + s.player.location + ' tiles=' + s.tileDeck.length +
+        ' hazardCards=' + s.hazardDeck.length + ' horrors=' + s.horrors.length +
+        ' pending=' + (s.pendingIntent ? s.pendingIntent.id : 'none'));
+    s.events = [];   // Only clear after generation sees them or Output uses them.
+    s.latestIntent = null;
+    return { text: out };
+};
+
+modifier(text)

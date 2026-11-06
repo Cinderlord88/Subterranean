@@ -1,0 +1,200 @@
+// ==============================================================
+// SUB TERRA | INPUT MODIFIER | PROTOTYPE v0.4
+// ==============================================================
+// STAGES:
+//   1. Explicit #command -> execute immediately in Input.
+//   2. CLEAR natural-language intent -> execute immediately.
+//   3. Possibly mechanical but ambiguous -> queue ONE AI assessment.
+//   4. Say-mode group directive -> deterministic move only when clear.
+//   5. All other obvious dialogue/narrative -> no mechanical action.
+//
+// Unlike old keyword triggers, candidate words NEVER spend AP.
+// Logs distinguish detection, rejection, pending AI and execution.
+// An AI decision is validated/executed exactly once in Output.
+
+// Normalize common AI Dungeon wrappers. In Say mode the quoted words
+// are the player's utterance, NOT the surrounding 'you say/insist' text.
+// This is crucial for team directives: '"Lets head East" you say.'
+// is an actionable group order, not a generic ambiguous quotation.
+// We continue to distinguish SAY from DO/STORY to avoid false movement.
+function stUnwrapSpokenQuotation(text) {
+    const t = String(text || '').trim();
+    const m = /^["“]([\s\S]*?)["”]\s*(?:(?:you|i)\s+(?:say|said|insist|reply|repeat|urge|order|call|shout|whisper|mutter|ask|exclaim|tell)\b[^.!?]*)?[.!?]*$/i.exec(t);
+    return m ? m[1].trim() : null;
+}
+function stExtractSubmission(raw) {
+    let t = String(raw || '').trim();
+    let mode = 'unknown';
+    let wrapper = 'plain';
+    // Example AI Dungeon Say display: > "Lets head East" you say.
+    // Also handles > "East....I said lets go to the east" you insist.
+    const display = t.replace(/^>\s*/, '');
+    if (/^>\s*#/.test(t)) { t=display; mode='do'; wrapper='command-prefix'; }
+    const said = stUnwrapSpokenQuotation(display);
+    if (said !== null) {
+        t = said;
+        mode = 'say';
+        wrapper = 'quoted-dialogue';
+    } else if (/^>\s*You\s+(?:say|ask|reply|insist|shout|whisper|mutter|exclaim)\b/i.test(t) ||
+               /^\s*(?:You|I)\s+say\s*:/i.test(t)) {
+        mode = 'say';
+        wrapper = 'say-prefix';
+        t = t.replace(/^>\s*You\s+(?:say|ask|reply|insist|shout|whisper|mutter|exclaim)\b\s*:?\s*/i, '');
+        t = t.replace(/^(?:You|I)\s+say\s*:\s*/i, '');
+        const quoted = stUnwrapSpokenQuotation(t);
+        if (quoted !== null) t = quoted;
+    } else if (/^>\s*You\s+/i.test(t)) {
+        mode = 'do';
+        wrapper = 'do-prefix';
+        t = t.replace(/^>\s*You\s+do\s*:?\s*/i, '');
+        t = t.replace(/^>\s*You\s+/i, '');
+    } else if (/^>\s*You\s+do\b/i.test(t)) {
+        mode = 'do';
+        wrapper = 'do-prefix';
+        t = t.replace(/^>\s*You\s+do\s*:?\s*/i, '');
+    } else if (/^["“]/.test(t)) {
+        mode = 'say';
+        wrapper = 'quoted-dialogue';
+        const quoted = stUnwrapSpokenQuotation(t);
+        if (quoted !== null) t = quoted;
+    }
+    // If history contains this exact current submission, honor its
+    // native Say/Do/Story mode; never use a previous action's type.
+    if (typeof history !== 'undefined' && Array.isArray(history) && history.length) {
+        const last = history[history.length - 1] || {};
+        const histText = String(last.rawText || last.text || '').trim();
+        const rawText = String(raw || '').trim();
+        if (histText && (histText === rawText || histText === t || histText.endsWith(rawText))) {
+            if (['say', 'story', 'do'].includes(last.type)) {
+                mode = last.type;
+                wrapper += '+history';
+            }
+        }
+    }
+    return { utterance: t.trim(), mode, wrapper };
+}
+
+// Post-action logging records whether an action actually spent AP,
+// moved, changed HP or produced an event. A failed skill check may
+// still consume AP and is NOT mistaken for an unattempted action.
+function stLogActionOutcome(id, command, source, before, returnValue) {
+    const s = state.subterra, p = s.player;
+    stLog('ACTION-RESULT', 'id=' + id + ' source=' + source + ' action=' + command +
+        ' returned=' + String(returnValue) + ' ap=' + before.ap + '->' + p.ap +
+        ' hp=' + before.hp + '->' + p.hp + ' loc=' + before.location + '->' + p.location +
+        ' eventCount=' + s.events.length);
+}
+
+const modifier = (text) => {
+    const s = stInit();
+    stInitSync(s).phase='INPUT';
+    const raw = typeof text === 'string' ? text : '';
+    const original = raw.trim();
+    stLog('INPUT', 'len=' + raw.length + ' round=' + s.round + ' AP=' + s.player.ap);
+    stLog('INPUT-RAW', JSON.stringify(original.slice(0, 260)));
+
+    // On some AI Dungeon flows the opening passes through Input.
+    // Never count/classify its story text as a player submission.
+    const opening = s.playerResponses === 0 &&
+        /^You were hired because the corporation claimed these caves/.test(original) &&
+        /Time to find a way out\.{2,}\s*$/i.test(original);
+    if (opening) { stLog('OPENING', 'initial scenario text; skip recognition'); return { text }; }
+
+    // Upgrade recovery: if a v0.3.1 adventure was saved at AP=0,
+    // resolve its stuck old round ONCE at the next actual player Input.
+    // No Context/Output invocation can trigger migration gameplay.
+    if (s.player.ap === 0 && s.lastResolvedRound !== s.round && !s.exited) {
+        stLog('ROUND-RECOVER', 'old save at zero AP round=' + s.round);
+        stEndTurn('RECOVER_STUCK_V03_ROUND');
+    }
+
+    // A new Input supersedes a previous unresolved intent. Context
+    // and Output can run several times without a new player message.
+    if (s.pendingIntent) {
+        stLog('INTENT-STALE', 'dropping id=' + s.pendingIntent.id + ' when new input arrived');
+        s.pendingIntent = null;
+    }
+    if (s.pendingLookReport) {
+        stLog('LOOK-CLEAR', 'superseded report response=' + s.pendingLookReport.response);
+        s.pendingLookReport = null;
+    }
+    s.latestIntent = null;
+    s.latestSubmission = null;
+    if (!original) { stLog('INPUT-SKIP', 'empty'); return { text }; }
+
+    // playerResponses remains a DIAGNOSTIC value. It no longer locks
+    // escape or turns off flashlights at a fixed story length.
+    s.playerResponses++;
+    s.intentSerial++;
+    const id = s.intentSerial;
+    stLog('RESPONSE', 'count=' + s.playerResponses + ' id=' + id + ' (telemetry only)');
+    const submission = stExtractSubmission(original);
+    const u = submission.utterance;
+    const mode = submission.mode;
+    stLog('INPUT-CLEAN', 'id=' + id + ' mode=' + mode + ' wrapper=' + submission.wrapper + ' text=' + JSON.stringify(u.slice(0, 260)));
+    const spoken=stPlayerSpeech(u, mode);
+    // This record survives until Output processes this submission. It is
+    // NOT an action; dialogue-only inputs still carry their exact words.
+    s.latestSubmission={ id, mode, spoken, raw:u.slice(0,700),
+        action:'NONE', status:'NARRATIVE_ONLY', source:'none' };
+    stLog('SPEECH', 'id='+id+' mode='+mode+' words='+JSON.stringify(spoken.slice(0,180)));
+
+
+    // Explicit command: user-directed API, not probabilistic NLP.
+    // Remove surrounding quotes left by AI Dungeon Say wrappers.
+    const match = /^#([a-z]+)(?:\s+([\s\S]*?))?\s*$/i.exec(u);
+    if (match) {
+        const cmd = match[1].toLowerCase(), arg = (match[2] || '').trim();
+        // #commands are control syntax, not in-world spoken dialogue.
+        s.latestSubmission.spoken='';
+        const before = { ap:s.player.ap, hp:s.player.hp, location:s.player.location };
+        stLog('INTENT-EXPLICIT', 'id=' + id + ' command=' + cmd + ' arg=' + arg);
+        const result = main(cmd, arg);
+        stLogActionOutcome(id, cmd, 'explicit', before, result);
+        s.latestIntent = { id, phase:'EXECUTED', source:'explicit', command:cmd, argument:arg };
+        Object.assign(s.latestSubmission,{action:cmd.toUpperCase(),argument:arg,status:'EXECUTED',source:'explicit',moved:before.location!==s.player.location});
+        const description = {
+            move: 'attempt to move ' + arg, look:'look around', rest:'rest',
+            rope:'secure a rope', skill:'use my specialist skill', hide:'hide',
+            fight:'attempt to fight', exert:'exert myself', endturn:'finish the round',
+            status:'check my status', help:'review possible actions',
+            reveal:'explore the passage ' + arg, dig:'clear rubble', escape:'attempt escape'
+        }[cmd] || ('try #' + cmd);
+        return { text: 'I ' + description + '.' };
+    }
+
+    // Stage 1: VERY conservative language matching. No AP is spent
+    // unless a clearly recognized action reaches the game function.
+    const clear = stDetectObviousIntent(u, mode);
+    if (clear) {
+        const before = { ap:s.player.ap, hp:s.player.hp, location:s.player.location };
+        stLog('INTENT-CLEAR', 'id=' + id + ' ' + clear.command + '(' + clear.argument + ') reason=' + clear.reason);
+        if (clear.reason === 'spoken team movement directive') {
+            stLog('INTENT-TEAM-SAY', 'id=' + id + ' MOVE ' + clear.argument + ' from=' + JSON.stringify(u));
+        }
+        const result = main(clear.command, clear.argument);
+        stLogActionOutcome(id, clear.command, 'natural', before, result);
+        s.latestIntent = { id, phase:'EXECUTED', source:'natural', command:clear.command, argument:clear.argument };
+        Object.assign(s.latestSubmission,{action:clear.command.toUpperCase(),argument:clear.argument,status:'EXECUTED',source:'natural',moved:before.location!==s.player.location});
+        return { text };
+    }
+
+    // Stage 2: Only a possible mechanical action reaches the AI.
+    // This stage does NOT change the cave or spend action points.
+    const candidate = stMayNeedAiIntent(u, mode);
+    if (candidate) {
+        Object.assign(s.latestSubmission,{action:'PENDING',status:'PENDING_AI',source:'ai'});
+        s.pendingIntent = {
+            id, input: u.slice(0, 500), mode, spoken,
+            status:'PENDING_AI', round:s.round,
+            location:s.player.location, ap:s.player.ap
+        };
+        stLog('INTENT-PENDING', 'id=' + id + ' action deferred to AI; ap=' + s.player.ap +
+            ' location=' + s.player.location);
+    } else {
+        stLog('INTENT-NARRATIVE', 'id=' + id + ' narrative/dialogue without mechanical action; spoken='+Boolean(spoken));
+    }
+    return { text };
+};
+
+modifier(text)

@@ -1,0 +1,59 @@
+// ==============================================================
+// SUB TERRA | CONTEXT MODIFIER | PROTOTYPE v0.4
+// ==============================================================
+// Structured Game Director: PLAYER COMMUNICATION, PLAYER ACTION,
+// VERIFIED GAME RESULTS, and NARRATION INSTRUCTIONS.
+// Context reads persistent state and supplies an authority snapshot.
+// It NEVER mutates mechanical reality or clears the event ledger.
+const modifier = (text) => {
+    const s=stInit(),sync=stInitSync(s),p=s.player;
+    sync.phase='CONTEXT';
+    const submission=s.latestSubmission;
+    const pending=s.pendingIntent && s.pendingIntent.status==='PENDING_AI' ? s.pendingIntent : null;
+    // Events are offered to ONE model generation then confirmed/
+    // fallback-delivered by Output. The event IDs allow debugging
+    // narration failures without blindly clearing the event list.
+    const offered=sync.pending.slice(-20);
+    for (const e of offered) e.offered=true;
+    sync.offered=offered.map(e=>e.id);
+    const speech=submission && submission.spoken ? submission.spoken : '';
+    const latestAction=submission ? submission.action+' / '+submission.status+
+        ' / '+submission.source+(submission.argument?' '+submission.argument:'') : 'NONE / NO_NEW_PLAYER_INPUT';
+    const lines=[
+        '=== SUB TERRA GAME DIRECTOR (HIDDEN; NOT STORY TEXT) ===',
+        '[PLAYER COMMUNICATION]',
+        'Mode: '+(submission?submission.mode:'NONE'),
+        'Spoken Words (verbatim): '+(speech?JSON.stringify(speech):'NONE'),
+        'Speech is separate from mechanics. NPCs near the player can hear it and react. Do not rewrite, add to, or speak for the player. Do not echo their entire utterance unnecessarily.',
+        '[PLAYER ACTION]',
+        'Interpretation: '+latestAction,
+        'PENDING_AI means the script has not performed the action. EXECUTED means JavaScript already attempted it; do not move anyone again. NONE means zero mechanical action, NOT zero dialogue.',
+        '[VERIFIED GAME RESULTS]',
+        stSyncSnapshot(),
+        'Current submission verified events (IDs are internal, not visible):',
+        ...(offered.length?offered.map(e=>e.visible ? 'EVENT '+e.id+' ['+e.kind+', observable]: '+e.text : 'EVENT '+e.id+' [UNOBSERVED]: Do not reveal the underlying event, source or location to the player.'):['No mechanical events this generation.']),
+        '[NARRATION INSTRUCTIONS]',
+        'JavaScript is authoritative for cave shape, tile discovery, player/NPC locations, HP, AP, equipment, hazards, and escape. NO unscripted movement or rooms. Do not invent what lies beyond an UNEXPLORED exit.',
+        'NPCs may speak independently and react to player speech. Narrate ALL observable, consequential verified actions, NPC movements, injuries and hazards in their order. Do not reveal out-of-sight activities, raw coordinates, card draws, or internal game mechanics.',
+        'If speech ordered group movement that the script EXECUTED, let NPCs acknowledge the order and narrate only the verified actual movement. If no move executed, do not describe arrival in a new chamber.',
+        s.pendingLookReport ? 'LOOK IN PROGRESS: Provide only nondirectional atmosphere/NPC reactions. Output will append exactly one map-authored N/E/S/W compass report. Do NOT write your own direction list.' : 'LOOK: Never invent direction-specific geology; the map reports N/E/S/W on an actual look.',
+        'Game rounds are independent of conversational exchanges. Player begins each round with 2 AP. Automatic NPC/hazard phase runs AFTER final AP is spent. There is no fixed response-count escape or battery cutoff; hazard-deck ending remains undecided.',
+        offered.some(e=>e.critical) ? 'NARRATION RECEIPT: When you have narrated an observable critical event, include one final line [ST_ACK|id1,id2] containing ONLY event IDs you actually conveyed. Omit IDs you did not narrate. Do not show this tag to the player.' : '',
+        pending ? '[INTENT ASSESSMENT: SPECIAL TASK]' : '',
+        pending ? 'Exact player input: '+JSON.stringify(pending.input)+'; mode '+pending.mode+'; spoken '+JSON.stringify(pending.spoken||'') : '',
+        pending ? 'Classify only the PLAYER\'S committed mechanical intent, NOT NPC suggestions, discussion or hypothetical travel. Accepted actions: MOVE (with cardinal N/E/S/W), LOOK, REST, ROPE, SKILL, HIDE, FIGHT; NONE (ordinary speech/narration); UNCERTAIN (a real attempted action but unresolved target). A spoken decision such as "East it is then" or "Fine, lets go north" is MOVE, NOT NONE. Never guess an unspecified direction.' : '',
+        pending ? 'For this AI-classified action, do NOT describe the action succeeding, new rooms, NPC movement, or hazards before the script resolves it in Output. You may briefly respond in character to spoken words. The VERY LAST line must be exactly one [ST_INTENT|MOVE|E|CERTAIN] (substitute validated action/direction), [ST_INTENT|NONE|-|CERTAIN], or [ST_INTENT|UNCERTAIN|-|LOW]. Other actions use argument -.' : '',
+        '=== END GAME DIRECTOR ==='
+    ].filter(Boolean);
+    const block='\n'+lines.join('\n')+'\n';
+    const maxChars=(typeof info!=='undefined' && Number.isFinite(info.maxChars))?info.maxChars:15000;
+    const memoryLength=(typeof info!=='undefined' && Number.isFinite(info.memoryLength))?Math.min(info.memoryLength,text.length):0;
+    const mem=text.slice(0,memoryLength),recent=text.slice(memoryLength);
+    const available=Math.max(0,maxChars-mem.length-block.length);
+    const merged=mem+recent.slice(-available)+block;
+    stLog('CONTEXT-SYNC','round='+s.round+' loc='+p.location+' AP='+p.ap+' speech='+Boolean(speech)+
+        ' submission='+(submission?submission.id:'none')+' pendingAI='+(pending?pending.id:'none')+
+        ' offered='+sync.offered.join(',')+' block='+block.length+' budget='+maxChars);
+    return {text:merged};
+};
+modifier(text)
