@@ -37,4 +37,12 @@ https://creativecommons.org/licenses/by-nc/4.0/
 
 ### Software
 
-This license applies to the written research and documentation. Software source code, if added to this repository, should be accompanied by a separately specified software license. Unless otherwise stated, no software license is granted by this notice.
+Unless otherwise noted, all original software source code in this repository is licensed under the **PolyForm Noncommercial License 1.0.0**.
+
+You may use, modify, and share the software for permitted noncommercial purposes, including personal AI Dungeon adventures.
+
+Commercial use requires separate permission from the copyright holder.
+
+See [LICENSE-CODE.md](LICENSE-CODE.md) for the complete software license.
+
+Copyright © 2026 Cinderlord88.
